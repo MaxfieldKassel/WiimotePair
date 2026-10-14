@@ -12,6 +12,8 @@ use objc2::{Message, msg_send, sel};
 use objc2_foundation::{NSNumber, NSUInteger};
 use objc2_io_bluetooth::{IOBluetoothDevice, IOBluetoothDevicePair};
 
+use crate::log::log;
+
 #[derive(Debug)]
 pub struct MissingApi(&'static str);
 
@@ -61,6 +63,7 @@ pub fn reply_pin_code(pair: &IOBluetoothDevicePair, device: &IOBluetoothDevice, 
     unsafe {
         let pairing_type: NSUInteger = msg_send![pair, currentPairingType];
         let peer: Option<Retained<AnyObject>> = msg_send![device, classicPeer];
+        log!("Replying to PIN code request: pairing type {pairing_type}, classic peer {peer:?}");
         let key = NSNumber::new_u64(key);
         let _: () = msg_send![&coordinator, pairPeer: peer.as_deref(), forType: pairing_type, withKey: &*key];
     }

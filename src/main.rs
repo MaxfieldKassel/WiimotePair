@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 mod errors;
+mod log;
 mod pairer;
 mod private_api;
 

@@ -17,6 +17,7 @@ use objc2_io_bluetooth::{
 };
 
 use crate::errors::{describe_io_return, describe_pairing_error};
+use crate::log::log;
 use crate::private_api;
 use crate::show_alert;
 
@@ -43,7 +44,9 @@ define_class!(
     unsafe impl CBCentralManagerDelegate for Pairer {
         #[unsafe(method(centralManagerDidUpdateState:))]
         fn central_manager_did_update_state(&self, central_manager: &CBCentralManager) {
-            self.handle_state(unsafe { central_manager.state() });
+            let state = unsafe { central_manager.state() };
+            log!("Bluetooth state changed to {}", state.0);
+            self.handle_state(state);
         }
     }
 
@@ -60,7 +63,8 @@ define_class!(
         }
 
         #[unsafe(method(deviceInquiryComplete:error:aborted:))]
-        fn device_inquiry_complete(&self, sender: Option<&IOBluetoothDeviceInquiry>, _error: c_int, aborted: bool) {
+        fn device_inquiry_complete(&self, sender: Option<&IOBluetoothDeviceInquiry>, error: c_int, aborted: bool) {
+            log!("Inquiry complete: error {error:#x}, aborted {aborted}");
             // Restart inquiries that have timed out.
             if let (Some(sender), false) = (sender, aborted) {
                 unsafe {
@@ -155,7 +159,10 @@ impl Pairer {
                 if let Some(inquiry) = inquiry {
                     unsafe { inquiry.setSearchType(IOBluetoothDeviceSearchTypesBits::Classic.0) };
                     *self.ivars().device_inquiry.borrow_mut() = Some(inquiry.clone());
-                    unsafe { inquiry.start() };
+                    let result = unsafe { inquiry.start() };
+                    log!("Started inquiry: {}", describe_io_return(result));
+                } else {
+                    log!("Could not create a device inquiry");
                 }
             }
             // TODO: handle CBManagerStateResetting?
@@ -164,8 +171,11 @@ impl Pairer {
     }
 
     fn handle_device_found(&self, inquiry: &IOBluetoothDeviceInquiry, device: &IOBluetoothDevice) {
+        let name = unsafe { device.name() }.to_string();
+        let address = unsafe { device.addressString() }.map(|address| address.to_string()).unwrap_or_default();
+
         // Skip unsupported devices.
-        if !unsafe { device.name() }.to_string().contains("Nintendo RVL-CNT-01") {
+        if !name.contains("Nintendo RVL-CNT-01") {
             // Clear devices to enable rediscovery if the name changes.
             unsafe { inquiry.clearFoundDevices() };
             return;
@@ -173,8 +183,11 @@ impl Pairer {
 
         // Skip already paired devices.
         if unsafe { device.isPaired() } {
+            log!("Found {name} ({address}), skipping since it is already paired");
             return;
         }
+
+        log!("Found {name} ({address}), connected {}, starting pairing", unsafe { device.isConnected() });
 
         unsafe { inquiry.stop() };
 
@@ -194,6 +207,7 @@ impl Pairer {
         *self.ivars().device_pair.borrow_mut() = Some(pair.clone());
 
         let result = unsafe { pair.start() };
+        log!("Started pairing: {}", describe_io_return(result));
         // Whoever takes the pair out of device_pair reports the outcome, so each attempt shows exactly one alert even
         // if IOBluetooth calls devicePairingFinished:error: before returning.
         if result != K_IO_RETURN_SUCCESS && self.take_device_pair().is_some() {
@@ -205,12 +219,19 @@ impl Pairer {
     }
 
     fn handle_pin_code_request(&self, pair: &IOBluetoothDevicePair) {
+        log!("PIN code requested");
+
         let Some(device) = (unsafe { pair.device() }) else {
+            log!("Pair has no device");
             return;
         };
 
         let result = controller_pin_key()
             .and_then(|key| private_api::reply_pin_code(pair, &device, key).map_err(|error| error.to_string()));
+
+        if let Err(message) = &result {
+            log!("Could not reply with PIN code: {message}");
+        }
 
         if let Err(message) = result
             && self.take_device_pair().is_some()
@@ -221,6 +242,8 @@ impl Pairer {
     }
 
     fn handle_pairing_finished(&self, error: c_int) {
+        log!("Pairing finished: {}", describe_pairing_error(error));
+
         // If there is no pair, the attempt was already abandoned and reported.
         let Some(pair) = self.take_device_pair() else {
             return;
@@ -271,6 +294,7 @@ fn controller_pin_key() -> Result<u64, String> {
     let address_string = unsafe { IOBluetoothHostController::defaultController() }
         .and_then(|controller| unsafe { controller.addressAsString() })
         .ok_or_else(|| "Could not determine the address of this Mac's Bluetooth controller.".to_string())?;
+    log!("Bluetooth controller address: {address_string}");
 
     let mut address = BluetoothDeviceAddress { data: [0; 6] };
     // SAFETY: address is a valid pointer to a BluetoothDeviceAddress.
@@ -282,7 +306,9 @@ fn controller_pin_key() -> Result<u64, String> {
         ));
     }
 
-    Ok(pin_key(&address))
+    let key = pin_key(&address);
+    log!("PIN bytes: {:02X?}", &key.to_ne_bytes()[..6]);
+    Ok(key)
 }
 
 fn pin_key(controller_address: &BluetoothDeviceAddress) -> u64 {
