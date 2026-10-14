@@ -42,22 +42,72 @@ pub fn set_user_defined_pincode(pair: &IOBluetoothDevicePair, enabled: bool) -> 
     Ok(())
 }
 
-fn coordinator() -> Result<Retained<AnyObject>, MissingApi> {
+/// Class methods that may return the shared IOBluetoothCoreBluetoothCoordinator. Its name differs between versions of
+/// macOS: macOS 27 does not have `sharedInstance`.
+const COORDINATOR_ACCESSORS: &[&CStr] =
+    &[c"sharedInstance", c"sharedCoordinator", c"defaultCoordinator", c"sharedManager", c"shared", c"coordinator"];
+
+/// Finds the IOBluetoothCoreBluetoothCoordinator that can reply to pairing requests.
+///
+/// `receiver` is the object that received a pairing request, which may be the coordinator itself or may know it.
+fn coordinator(receiver: Option<&AnyObject>) -> Result<Retained<AnyObject>, MissingApi> {
+    let can_pair = |object: &AnyObject| object.class().responds_to(sel!(pairPeer:forType:withKey:));
+
+    if let Some(receiver) = receiver {
+        if can_pair(receiver) {
+            return Ok(receiver.retain());
+        }
+        if receiver.class().responds_to(sel!(coordinator)) {
+            // SAFETY: The method exists, and is assumed to be a getter that returns an object.
+            let coordinator: Option<Retained<AnyObject>> = unsafe { msg_send![receiver, coordinator] };
+            if let Some(coordinator) = coordinator.filter(|coordinator| can_pair(coordinator)) {
+                return Ok(coordinator);
+            }
+        }
+    }
+
     let coordinator_class = AnyClass::get(c"IOBluetoothCoreBluetoothCoordinator")
         .ok_or(MissingApi("IOBluetoothCoreBluetoothCoordinator"))?;
-    // SAFETY: The class method exists and returns an object.
-    let coordinator: Option<Retained<AnyObject>> = unsafe {
-        if coordinator_class.responds_to(sel!(sharedInstance)) {
-            msg_send![coordinator_class, sharedInstance]
-        } else {
-            None
+    for name in COORDINATOR_ACCESSORS {
+        let selector = Sel::register(name);
+        // Only call getters: methods that take no arguments and return an object.
+        let Some(method) = coordinator_class.class_method(selector) else {
+            continue;
+        };
+        if method.arguments_count() != 2 || method.return_type().to_bytes() != b"@" {
+            continue;
         }
-    };
-    let coordinator = coordinator.ok_or(MissingApi("+[IOBluetoothCoreBluetoothCoordinator sharedInstance]"))?;
-    if !coordinator.class().responds_to(sel!(pairPeer:forType:withKey:)) {
-        return Err(MissingApi("-[IOBluetoothCoreBluetoothCoordinator pairPeer:forType:withKey:]"));
+        // SAFETY: The class method exists, takes no arguments and returns an object.
+        let coordinator: Option<Retained<AnyObject>> =
+            unsafe { msg_send![coordinator_class, performSelector: selector] };
+        if let Some(coordinator) = coordinator.filter(|coordinator| can_pair(coordinator)) {
+            return Ok(coordinator);
+        }
     }
-    Ok(coordinator)
+
+    Err(MissingApi("-[IOBluetoothCoreBluetoothCoordinator pairPeer:forType:withKey:]"))
+}
+
+/// Logs the methods of a class that are related to pairing, to help find replacements for private APIs that change.
+fn log_methods(class_name: &CStr) {
+    let Some(class) = AnyClass::get(class_name) else {
+        log!("{} does not exist", class_name.to_string_lossy());
+        return;
+    };
+    let keywords = ["pair", "pin", "shared", "coordinator", "respond", "reply", "agent", "passkey", "instance"];
+    for (prefix, class) in [("+", class.metaclass()), ("-", class)] {
+        for method in class.instance_methods().iter() {
+            let name = method.name().name().to_string_lossy();
+            if !keywords.iter().any(|keyword| name.to_lowercase().contains(keyword)) {
+                continue;
+            }
+            // SAFETY: The method is valid, and the encoding is a static string or NULL.
+            let encoding = unsafe { ffi::method_getTypeEncoding(*method) };
+            let encoding =
+                if encoding.is_null() { "?".into() } else { unsafe { CStr::from_ptr(encoding) }.to_string_lossy() };
+            log!("  {prefix}[{} {name}] {encoding}", class_name.to_string_lossy());
+        }
+    }
 }
 
 /// Replies to a PIN code request with the given key.
@@ -69,7 +119,7 @@ pub fn reply_pin_code(pair: &IOBluetoothDevicePair, device: &IOBluetoothDevice, 
     require(pair, sel!(currentPairingType), "-[IOBluetoothDevicePair currentPairingType]")?;
     require(device, sel!(classicPeer), "-[IOBluetoothDevice classicPeer]")?;
 
-    let coordinator = coordinator()?;
+    let coordinator = coordinator(None)?;
 
     // SAFETY: These methods exist (checked above) and have these signatures.
     unsafe {
@@ -156,6 +206,12 @@ pub fn install_pairing_hook() {
     if original_imps.is_empty() {
         log!("Not hooking pairing requests: no class implements {selector}");
     }
+    drop(original_imps);
+
+    log!("Pairing related methods:");
+    for class_name in [c"IOBluetoothCoreBluetoothCoordinator", c"IOBluetoothDevicePair", c"CBPairingAgent"] {
+        log_methods(class_name);
+    }
 }
 
 /// Finds the original implementation for the class of `object`, or the nearest hooked superclass.
@@ -182,15 +238,18 @@ unsafe extern "C-unwind" fn peer_did_request_pairing(
     passkey: *mut AnyObject,
 ) {
     // The passkey's type is not known for certain, so it is only logged as a pointer.
-    log!("Pairing agent requested pairing: type {pairing_type}, passkey {passkey:p}, peer {peer:p}");
+    // SAFETY: this is a valid object, since the runtime is calling a method on it.
+    let class = unsafe { this.as_ref() }.map(|this| this.class().name().to_string_lossy()).unwrap_or_default();
+    log!("Pairing agent requested pairing from {class}: type {pairing_type}, passkey {passkey:p}, peer {peer:p}");
 
     let key = *PAIRING_KEY.lock().unwrap_or_else(|error| error.into_inner());
     if let Some(key) = key
         && !peer.is_null()
     {
-        match coordinator() {
+        // SAFETY: this is a valid object, since the runtime is calling a method on it.
+        match coordinator(unsafe { this.as_ref() }) {
             Ok(coordinator) => {
-                log!("Replying to pairing request with the Wii Remote's PIN");
+                log!("Replying to pairing request with the Wii Remote's PIN through {coordinator:?}");
                 let key = NSNumber::new_u64(key);
                 // SAFETY: The method exists (checked by coordinator()), and peer is the peer that requested pairing.
                 let _: () = unsafe {
