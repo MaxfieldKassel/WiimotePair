@@ -55,3 +55,8 @@ cat ~/Library/Containers/org.dolphin-emu.WiimotePair/Data/Library/Logs/WiimotePa
 ```
 
 Include this log when reporting a pairing problem.
+
+`scripts/debug-pairing.sh` builds the app, runs it while recording the
+Bluetooth logs, and collects both logs into a folder on the Desktop. It pauses
+PerfPowerServices while the app runs, since it answers Wii Remote PIN requests
+without the right PIN before WiimotePair can (pass `--no-pause` to skip this).
