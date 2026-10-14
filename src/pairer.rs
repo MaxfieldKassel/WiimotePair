@@ -25,9 +25,9 @@ const K_IO_RETURN_SUCCESS: c_int = 0;
 
 /// How many times to retry pairing a Wii Remote without telling the user.
 ///
-/// System daemons such as PerfPowerServices also reply to the Wii Remote's PIN code request, without the right PIN,
-/// and bluetoothd only uses the first reply. WiimotePair's reply is usually first, but not always, so a failed attempt
-/// is worth retrying while the Wii Remote is still in pairing mode.
+/// Pairing sometimes fails for reasons outside WiimotePair's control, for example when a system daemon such as
+/// PerfPowerServices replies to the Wii Remote's PIN code request first, without the right PIN. A failed attempt is
+/// worth retrying while the Wii Remote is still in pairing mode.
 const AUTOMATIC_RETRIES: u32 = 3;
 
 pub struct PairerIvars {
@@ -36,6 +36,7 @@ pub struct PairerIvars {
     device_inquiry: RefCell<Option<Retained<IOBluetoothDeviceInquiry>>>,
     device_pair: RefCell<Option<Retained<IOBluetoothDevicePair>>>,
     failed_attempts: Cell<u32>,
+    showing_result: Cell<bool>,
 }
 
 define_class!(
@@ -73,8 +74,9 @@ define_class!(
         #[unsafe(method(deviceInquiryComplete:error:aborted:))]
         fn device_inquiry_complete(&self, sender: Option<&IOBluetoothDeviceInquiry>, error: c_int, aborted: bool) {
             log!("Inquiry complete: error {error:#x}, aborted {aborted}");
-            // Restart inquiries that have timed out.
-            if let (Some(sender), false) = (sender, aborted) {
+            // Restart inquiries that have timed out, unless a Wii Remote is being paired or the result of pairing one
+            // is being shown. Stopping an inquiry to pair a Wii Remote also reports it as complete without aborting.
+            if let (Some(sender), false, false) = (sender, aborted, self.is_busy()) {
                 unsafe {
                     sender.clearFoundDevices();
                     sender.start();
@@ -106,6 +108,7 @@ impl Pairer {
             device_inquiry: RefCell::new(None),
             device_pair: RefCell::new(None),
             failed_attempts: Cell::new(0),
+            showing_result: Cell::new(false),
         });
         // SAFETY: NSObject's init method has this signature.
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
@@ -133,6 +136,10 @@ impl Pairer {
 
     fn device_inquiry(&self) -> Option<Retained<IOBluetoothDeviceInquiry>> {
         self.ivars().device_inquiry.borrow().clone()
+    }
+
+    fn is_busy(&self) -> bool {
+        self.ivars().device_pair.borrow().is_some() || self.ivars().showing_result.get()
     }
 
     fn take_device_pair(&self) -> Option<Retained<IOBluetoothDevicePair>> {
@@ -193,6 +200,10 @@ impl Pairer {
         if !name.contains("Nintendo RVL-CNT-01") {
             // Clear devices to enable rediscovery if the name changes.
             unsafe { inquiry.clearFoundDevices() };
+            return;
+        }
+
+        if self.is_busy() {
             return;
         }
 
@@ -294,9 +305,13 @@ impl Pairer {
 
     fn show_pairing_result_alert(&self, title: &str, text: &str) {
         self.ivars().failed_attempts.set(0);
+        self.ivars().showing_result.set(true);
         let this = self.retain();
-        // Resume searching so another Wii Remote (or another attempt with the same one) can be paired.
-        self.show_alert(title, text, move || this.resume_inquiry());
+        self.show_alert(title, text, move || {
+            // Resume searching so another Wii Remote (or another attempt with the same one) can be paired.
+            this.ivars().showing_result.set(false);
+            this.resume_inquiry();
+        });
     }
 
     fn resume_inquiry(&self) {

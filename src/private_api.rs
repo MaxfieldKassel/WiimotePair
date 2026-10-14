@@ -9,7 +9,7 @@
 use std::ffi::{CStr, c_uint};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::{AnyClass, AnyObject, Imp, NSObjectProtocol, Sel};
@@ -113,11 +113,7 @@ pub fn reply_pin_code(pair: &IOBluetoothDevicePair, device: &IOBluetoothDevice, 
     Ok(())
 }
 
-/// A reply to the Wii Remote's PIN code request, prepared in advance so that it can be sent as quickly as possible.
-///
-/// Several system daemons, such as PerfPowerServices and cloudpaird, register pairing agents that reply to every PIN
-/// code request without the right PIN, and bluetoothd only uses the first reply it receives. On macOS 27, they reply
-/// within about 0.3 ms of the request, so WiimotePair has to reply before them.
+/// A reply to the Wii Remote's PIN code request, prepared before pairing starts.
 struct PinReply {
     coordinator: Retained<AnyObject>,
     peer: Retained<AnyObject>,
@@ -130,8 +126,16 @@ unsafe impl Send for PinReply {}
 
 static PIN_REPLY: Mutex<Option<PinReply>> = Mutex::new(None);
 
-/// Whether the PIN was sent when the pairing agent received a request, before its delegate was called. Only logged.
-static REPLIED: AtomicBool = AtomicBool::new(false);
+/// Whether the pairing agent hook has handled the current request, so that its delegate does not reply again.
+static HANDLED: AtomicBool = AtomicBool::new(false);
+
+/// How long to wait before replying to a request that says it is for PIN code pairing.
+///
+/// bluetoothd sends that request (`kCBMsgArgPairingType` = 6) only to the app that started pairing, before it has set
+/// up its own state for the PIN code request. A reply that arrives before then fails with "Unexpected pincode length"
+/// within a few milliseconds, while one that arrives afterwards succeeds. bluetoothd is ready about 1 ms after sending
+/// the request, and waits several seconds for the reply.
+const PIN_REPLY_DELAY: Duration = Duration::from_millis(20);
 
 /// The pairing type that bluetoothd uses for PIN code (legacy) pairing.
 ///
@@ -148,7 +152,7 @@ pub fn prepare_pin_reply(device: &IOBluetoothDevice, key: u64) -> Result<(), Mis
     let coordinator = coordinator(None)?;
     log!("Prepared PIN reply through {coordinator:?} for {peer:?}");
 
-    REPLIED.store(false, Ordering::SeqCst);
+    HANDLED.store(false, Ordering::SeqCst);
     *PIN_REPLY.lock().unwrap_or_else(|error| error.into_inner()) =
         Some(PinReply { coordinator, peer, key: NSNumber::new_u64(key) });
     Ok(())
@@ -156,7 +160,11 @@ pub fn prepare_pin_reply(device: &IOBluetoothDevice, key: u64) -> Result<(), Mis
 
 pub fn clear_pin_reply() {
     *PIN_REPLY.lock().unwrap_or_else(|error| error.into_inner()) = None;
-    REPLIED.store(false, Ordering::SeqCst);
+    HANDLED.store(false, Ordering::SeqCst);
+}
+
+fn has_pin_reply() -> bool {
+    PIN_REPLY.lock().unwrap_or_else(|error| error.into_inner()).is_some()
 }
 
 /// Sends the prepared PIN reply, if there is one.
@@ -170,6 +178,43 @@ fn send_pin_reply() -> bool {
         msg_send![&reply.coordinator, pairPeer: &*reply.peer, forType: PIN_CODE_PAIRING_TYPE, withKey: &*reply.key]
     };
     true
+}
+
+/// Replies to a pairing request of the given type with the prepared PIN.
+///
+/// Requests for PIN code pairing are answered after [`PIN_REPLY_DELAY`]. Other requests, which bluetoothd sends to
+/// every pairing agent, are answered immediately: system daemons such as PerfPowerServices reply to those without the
+/// right PIN within about 0.3 ms, and bluetoothd only uses the first reply.
+fn reply_to_request(pairing_type: Option<isize>, source: &'static str) {
+    if pairing_type == Some(PIN_CODE_PAIRING_TYPE) {
+        std::thread::spawn(move || {
+            std::thread::sleep(PIN_REPLY_DELAY);
+            if send_pin_reply() {
+                log!("Replied to PIN code pairing request from the {source} after {} ms", PIN_REPLY_DELAY.as_millis());
+            }
+        });
+    } else {
+        let start = Instant::now();
+        if send_pin_reply() {
+            log!(
+                "Replied to pairing request of type {pairing_type:?} from the {source} in {} µs",
+                start.elapsed().as_micros()
+            );
+        }
+    }
+}
+
+/// Returns `kCBMsgArgPairingType` from a pairing request that CoreBluetooth received from bluetoothd.
+fn request_pairing_type(message: &AnyObject) -> Option<isize> {
+    if !message.class().responds_to(sel!(objectForKey:)) {
+        return None;
+    }
+    // SAFETY: The message is a dictionary, which responds to objectForKey: with an object or nil.
+    let value: Option<Retained<AnyObject>> =
+        unsafe { msg_send![message, objectForKey: objc2_foundation::ns_string!("kCBMsgArgPairingType")] };
+    let value = value.filter(|value| value.class().responds_to(sel!(integerValue)))?;
+    // SAFETY: The value responds to integerValue, which returns an NSInteger.
+    Some(unsafe { msg_send![&value, integerValue] })
 }
 
 /// The implementations replaced by [`install_pairing_hooks`], by class and selector.
@@ -186,8 +231,8 @@ type HandlePairingRequested = unsafe extern "C-unwind" fn(*mut AnyObject, Sel, *
 /// `-pairingAgent:peerDidRequestPairing:type:passkey:` on IOBluetooth, which replies without the PIN and never asks
 /// IOBluetoothDevicePair's delegate for one.
 ///
-/// While a PIN reply is prepared, the hooks send it as early as possible: when the pairing agent receives the request,
-/// or failing that, when its delegate is called.
+/// While a PIN reply is prepared, the hooks reply with it when the pairing agent receives the request, or failing that,
+/// when its delegate is called. See [`reply_to_request`] for when.
 pub fn install_pairing_hooks() {
     let hooked = hook_classes_in_image(c"CBPairingAgent", sel!(handlePairingRequested:), 3, unsafe {
         std::mem::transmute::<HandlePairingRequested, Imp>(handle_pairing_requested)
@@ -284,11 +329,13 @@ struct SendObject(Retained<AnyObject>);
 unsafe impl Send for SendObject {}
 
 unsafe extern "C-unwind" fn handle_pairing_requested(this: *mut AnyObject, cmd: Sel, message: *mut AnyObject) {
-    // Reply before doing anything else, to beat the system daemons' replies. Logging happens on another thread.
-    let start = Instant::now();
-    if send_pin_reply() {
-        REPLIED.store(true, Ordering::SeqCst);
-        log!("Replied to pairing request with the Wii Remote's PIN in {} µs", start.elapsed().as_micros());
+    // Handle the request before doing anything else, since some requests must be answered as quickly as possible.
+    // Logging happens on another thread.
+    if has_pin_reply() {
+        // SAFETY: The message is an object, as the method's type encoding says.
+        let pairing_type = unsafe { message.as_ref() }.and_then(request_pairing_type);
+        HANDLED.store(true, Ordering::SeqCst);
+        reply_to_request(pairing_type, "pairing agent");
     }
 
     match original_imp(this, cmd) {
@@ -321,17 +368,15 @@ unsafe extern "C-unwind" fn peer_did_request_pairing(
     pairing_type: isize,
     passkey: *mut AnyObject,
 ) {
-    // Send the PIN again even if it was already sent when the pairing agent received the request, in case that was a
-    // different request. bluetoothd ignores replies to requests that were already answered. Never call the original
-    // implementation while a reply is prepared, since it would reply without the PIN.
-    let already_replied = REPLIED.swap(false, Ordering::SeqCst);
-    let start = Instant::now();
-    if send_pin_reply() {
-        log!(
-            "Replied to pairing request with the Wii Remote's PIN from the delegate in {} µs (already replied: \
-             {already_replied}): requested type {pairing_type}, passkey {passkey:p}",
-            start.elapsed().as_micros()
-        );
+    if HANDLED.swap(false, Ordering::SeqCst) {
+        // Calling the original implementation would reply again, without the PIN.
+        log!("Pairing agent delegate called: type {pairing_type}, passkey {passkey:p}; already handled");
+        return;
+    }
+
+    if has_pin_reply() {
+        let pairing_type = if pairing_type == 0 { None } else { Some(pairing_type) };
+        reply_to_request(pairing_type, "pairing agent delegate");
         return;
     }
 
