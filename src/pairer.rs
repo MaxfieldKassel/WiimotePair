@@ -18,7 +18,7 @@ use objc2_io_bluetooth::{
 
 use crate::errors::{describe_io_return, describe_pairing_error};
 use crate::log::log;
-use crate::private_api;
+use crate::private_api::{self, ReplyPath};
 use crate::show_alert;
 
 const K_IO_RETURN_SUCCESS: c_int = 0;
@@ -26,9 +26,9 @@ const K_IO_RETURN_SUCCESS: c_int = 0;
 /// How many times to retry pairing a Wii Remote without telling the user.
 ///
 /// Pairing sometimes fails for reasons outside WiimotePair's control, for example when a system daemon such as
-/// PerfPowerServices replies to the Wii Remote's PIN code request first, without the right PIN. Retries also try the PIN
-/// for the other pairing button (see [`PairingButton`]). A failed attempt is worth retrying while the Wii Remote is still
-/// in pairing mode.
+/// PerfPowerServices replies to the Wii Remote's PIN code request first, without the right PIN. Retries also try other
+/// ways of replying (see [`attempt_plan`]). A failed attempt is worth retrying while the Wii Remote is still in pairing
+/// mode.
 const AUTOMATIC_RETRIES: u32 = 3;
 
 pub struct PairerIvars {
@@ -139,8 +139,8 @@ impl Pairer {
         self.ivars().device_inquiry.borrow().clone()
     }
 
-    fn pairing_button(&self) -> PairingButton {
-        PairingButton::for_attempt(self.ivars().failed_attempts.get())
+    fn attempt_plan(&self) -> (PairingButton, ReplyPath) {
+        attempt_plan(self.ivars().failed_attempts.get())
     }
 
     fn is_busy(&self) -> bool {
@@ -236,8 +236,9 @@ impl Pairer {
         }
 
         // The pairing hooks reply to the Wii Remote's PIN code request while the pair is active.
-        let prepared = pin_key_for(self.pairing_button(), device)
-            .and_then(|key| private_api::prepare_pin_reply(device, key).map_err(|error| error.to_string()));
+        let (button, path) = self.attempt_plan();
+        let prepared = pin_key_for(button, device)
+            .and_then(|key| private_api::prepare_pin_reply(device, key, path).map_err(|error| error.to_string()));
         if let Err(message) = prepared {
             self.show_pairing_result_alert("Pairing Error", &message);
             return;
@@ -265,7 +266,7 @@ impl Pairer {
             return;
         };
 
-        let result = pin_key_for(self.pairing_button(), &device)
+        let result = pin_key_for(self.attempt_plan().0, &device)
             .and_then(|key| private_api::reply_pin_code(pair, &device, key).map_err(|error| error.to_string()));
 
         if let Err(message) = &result {
@@ -345,11 +346,15 @@ enum PairingButton {
     OneAndTwo,
 }
 
-impl PairingButton {
-    /// There is no way to tell which button was pressed, so attempts alternate between them, starting with SYNC.
-    fn for_attempt(attempt: u32) -> Self {
-        if attempt.is_multiple_of(2) { Self::Sync } else { Self::OneAndTwo }
-    }
+/// Returns which PIN to use and how to send it for the given attempt (0 for the first).
+///
+/// There is no way to tell which button was pressed, so attempts alternate between the buttons' PINs, starting with
+/// SYNC. Each PIN is sent through the pairing agent, which works for genuine Wii Remotes, and then straight to the
+/// Bluetooth controller (see [`ReplyPath::Controller`]).
+fn attempt_plan(attempt: u32) -> (PairingButton, ReplyPath) {
+    let button = if (attempt / 2).is_multiple_of(2) { PairingButton::Sync } else { PairingButton::OneAndTwo };
+    let path = if attempt.is_multiple_of(2) { ReplyPath::PairingAgent } else { ReplyPath::Controller };
+    (button, path)
 }
 
 /// Returns the PIN the Wii Remote expects, as a key for the pairing coordinator.
@@ -375,9 +380,12 @@ fn pin_key_for(button: PairingButton, device: &IOBluetoothDevice) -> Result<u64,
     }
 
     let key = pin_key(&address);
+    let pin = &key.to_le_bytes()[..6];
+    // bluetoothd may try to save the PIN as a UTF-8 string (see ReplyPath::Controller).
     log!(
-        "Using the PIN for the {button:?} button, from the address of {owner} ({address_string}): {:02X?}",
-        &key.to_ne_bytes()[..6]
+        "Using the PIN for the {button:?} button, from the address of {owner} ({address_string}): {pin:02X?}, valid \
+         UTF-8: {}",
+        std::str::from_utf8(pin).is_ok()
     );
     Ok(key)
 }
@@ -387,7 +395,7 @@ fn pin_key(address: &BluetoothDeviceAddress) -> u64 {
     for (pin_byte, address_byte) in pin.iter_mut().zip(address.data.iter().rev()) {
         *pin_byte = *address_byte;
     }
-    u64::from_ne_bytes(pin)
+    u64::from_le_bytes(pin)
 }
 
 #[cfg(test)]
@@ -395,17 +403,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn attempts_alternate_between_buttons() {
-        let buttons: Vec<_> = (0..4).map(PairingButton::for_attempt).collect();
+    fn attempts_cycle_through_buttons_and_reply_paths() {
+        let plans: Vec<_> = (0..5).map(attempt_plan).collect();
         assert_eq!(
-            buttons,
-            [PairingButton::Sync, PairingButton::OneAndTwo, PairingButton::Sync, PairingButton::OneAndTwo]
+            plans,
+            [
+                (PairingButton::Sync, ReplyPath::PairingAgent),
+                (PairingButton::Sync, ReplyPath::Controller),
+                (PairingButton::OneAndTwo, ReplyPath::PairingAgent),
+                (PairingButton::OneAndTwo, ReplyPath::Controller),
+                (PairingButton::Sync, ReplyPath::PairingAgent),
+            ]
         );
     }
 
     #[test]
     fn pin_key_is_reversed_address() {
         let address = BluetoothDeviceAddress { data: [0x00, 0x11, 0x22, 0x33, 0x44, 0x55] };
-        assert_eq!(pin_key(&address).to_ne_bytes(), [0x55, 0x44, 0x33, 0x22, 0x11, 0x00, 0x00, 0x00]);
+        assert_eq!(pin_key(&address).to_le_bytes(), [0x55, 0x44, 0x33, 0x22, 0x11, 0x00, 0x00, 0x00]);
     }
 }
