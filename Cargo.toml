@@ -1,0 +1,72 @@
+[package]
+name = "wiimotepair"
+version = "1.0.0"
+edition = "2024"
+license = "GPL-2.0-or-later"
+description = "A utility app that pairs Wii Remotes to Macs"
+repository = "https://github.com/dolphin-emu/WiimotePair"
+publish = false
+
+[[bin]]
+name = "WiimotePair"
+path = "src/main.rs"
+
+[dependencies]
+block2 = "0.6"
+objc2 = "0.6"
+
+[dependencies.objc2-foundation]
+version = "0.3"
+default-features = false
+features = ["std", "NSGeometry", "NSNotification", "NSObject", "NSString", "NSValue"]
+
+[dependencies.objc2-app-kit]
+version = "0.3"
+default-features = false
+features = [
+    "std",
+    "block2",
+    "NSAlert",
+    "NSApplication",
+    "NSButton",
+    "NSCell",
+    "NSControl",
+    "NSEvent",
+    "NSGraphics",
+    "NSMenu",
+    "NSMenuItem",
+    "NSProgressIndicator",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSText",
+    "NSTextField",
+    "NSView",
+    "NSWindow",
+    "NSWindowRestoration",
+]
+
+[dependencies.objc2-core-bluetooth]
+version = "0.3"
+default-features = false
+features = ["std", "CBCentralManager", "CBManager", "dispatch2"]
+
+[dependencies.objc2-io-bluetooth]
+version = "0.3"
+default-features = false
+features = [
+    "std",
+    "objc2",
+    "objc2-foundation",
+    "Bluetooth",
+    "IOBluetoothDevice",
+    "IOBluetoothDeviceInquiry",
+    "IOBluetoothDevicePair",
+    "IOBluetoothHostController",
+    "IOBluetoothObject",
+    "IOBluetoothUserLib",
+    "IOBluetoothUtilities",
+]
+
+[profile.release]
+lto = true
+strip = true

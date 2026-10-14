@@ -6,29 +6,41 @@ The latest download can be found [here](https://github.com/dolphin-emu/WiimotePa
 
 ## Building
 
-### Xcode
+This branch contains two implementations of WiimotePair:
 
-Open `WiimotePair.xcodeproj` and build the `WiimotePair` scheme.
+- A Rust version in `src/`, built with Cargo using the
+  [objc2](https://github.com/madsmtm/objc2) bindings to AppKit, CoreBluetooth
+  and IOBluetooth.
+- The original Objective-C version in `WiimotePair/`.
+
+Both behave the same and produce the same app bundle.
 
 ### Nix
 
-WiimotePair can also be built on macOS with [Nix](https://nixos.org) without
-installing Xcode:
+On macOS with [Nix](https://nixos.org), no Xcode installation is needed:
 
 ```sh
-nix build
+nix build            # Rust version
+nix build .#objc     # Objective-C version
 open result/Applications/WiimotePair.app
 ```
 
 For development, `nix develop` provides a shell with everything needed to run
-`make`, which places the app at `build/WiimotePair.app`.
+`make` (Rust, output in `build/WiimotePair.app`) or `make objc` (Objective-C,
+output in `build/objc/WiimotePair.app`), as well as `cargo`, `clippy` and
+`rustfmt`.
 
-This build cannot compile `Main.storyboard` or `Assets.xcassets`, since that
-requires Apple's `ibtool` and `actool`, which only ship with Xcode. Instead it
-uses `nix/main.m`, which builds the same window and menu bar in code, along
-with a handwritten `nix/Info.plist` and an icon generated from the PNGs in the
+Neither build can compile `Main.storyboard` or `Assets.xcassets`, since that
+requires Apple's `ibtool` and `actool`, which only ship with Xcode. Instead,
+both create the window and menu bar in code (`src/main.rs` and `nix/main.m`),
+use a handwritten `nix/Info.plist`, and generate the icon from the PNGs in the
 asset catalog. Changes to the storyboard or the Xcode project's Info.plist
 settings need to be mirrored there.
 
 The resulting app is ad-hoc signed, which is fine for local use but not for
 distribution.
+
+### Xcode
+
+The Objective-C version can also be built by opening `WiimotePair.xcodeproj`
+and building the `WiimotePair` scheme.

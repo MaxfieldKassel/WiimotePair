@@ -70,3 +70,6 @@ iOSInjectionProject/
 # Nix
 result
 result-*
+
+# Rust
+/target

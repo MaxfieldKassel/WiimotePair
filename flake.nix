@@ -11,47 +11,74 @@
         "x86_64-darwin"
       ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+
+      common = pkgs: {
+        version = "1.0";
+        src = self;
+
+        nativeBuildInputs = [
+          pkgs.python3
+          pkgs.rcodesign
+        ];
+
+        buildInputs = [
+          pkgs.apple-sdk_14
+          (pkgs.darwinMinVersionHook "12.0")
+        ];
+
+        # Fixup would modify the binary after it has been signed.
+        dontFixup = true;
+
+        meta = {
+          description = "Pairs Wii Remotes to Macs";
+          homepage = "https://github.com/dolphin-emu/WiimotePair";
+          license = pkgs.lib.licenses.gpl2Plus;
+          platforms = pkgs.lib.platforms.darwin;
+        };
+      };
     in
     {
       packages = forAllSystems (pkgs: {
-        default = pkgs.stdenv.mkDerivation {
-          pname = "WiimotePair";
-          version = "1.0";
+        default = self.packages.${pkgs.stdenv.hostPlatform.system}.rust;
 
-          src = self;
+        rust = pkgs.rustPlatform.buildRustPackage (
+          common pkgs
+          // {
+            pname = "WiimotePair";
+            cargoLock.lockFile = ./Cargo.lock;
 
-          nativeBuildInputs = [
-            pkgs.python3
-            pkgs.rcodesign
-          ];
+            postInstall = ''
+              mkdir -p $out/Applications
+              sh nix/bundle.sh $out/bin/WiimotePair $out/Applications/WiimotePair.app
+              rm -r $out/bin
+            '';
+          }
+        );
 
-          buildInputs = [
-            pkgs.apple-sdk_14
-            (pkgs.darwinMinVersionHook "12.0")
-          ];
+        objc = pkgs.stdenv.mkDerivation (
+          common pkgs
+          // {
+            pname = "WiimotePair-objc";
 
-          installPhase = ''
-            runHook preInstall
-            mkdir -p $out/Applications
-            cp -R build/WiimotePair.app $out/Applications/
-            runHook postInstall
-          '';
+            buildFlags = [ "objc" ];
 
-          # Fixup would modify the binary after it has been signed.
-          dontFixup = true;
-
-          meta = {
-            description = "Pairs Wii Remotes to Macs";
-            homepage = "https://github.com/dolphin-emu/WiimotePair";
-            license = pkgs.lib.licenses.gpl2Plus;
-            platforms = pkgs.lib.platforms.darwin;
-          };
-        };
+            installPhase = ''
+              runHook preInstall
+              mkdir -p $out/Applications
+              cp -R build/objc/WiimotePair.app $out/Applications/
+              runHook postInstall
+            '';
+          }
+        );
       });
 
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
-          inputsFrom = [ self.packages.${pkgs.stdenv.hostPlatform.system}.default ];
+          inputsFrom = [ self.packages.${pkgs.stdenv.hostPlatform.system}.rust ];
+          packages = [
+            pkgs.clippy
+            pkgs.rustfmt
+          ];
         };
       });
     };
