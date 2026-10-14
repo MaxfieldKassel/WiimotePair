@@ -3,10 +3,10 @@
 
 //! Diagnostic logging.
 //!
-//! Messages are written on a background thread. They go to NSLog, which writes to stderr and to the unified log.
-//! However, the unified log redacts their contents as `<private>`, so they are also written to
-//! `~/Library/Logs/WiimotePair.log`. When WiimotePair is sandboxed, `~` is its container, so the file is at
-//! `~/Library/Containers/org.dolphin-emu.WiimotePair/Data/Library/Logs/WiimotePair.log`.
+//! Messages are written on a background thread to stderr and to `~/Library/Logs/WiimotePair.log`. When WiimotePair is
+//! sandboxed, `~` is its container, so the file is at
+//! `~/Library/Containers/org.dolphin-emu.WiimotePair/Data/Library/Logs/WiimotePair.log`. NSLog is not used, since the
+//! unified log redacts its messages as `<private>`.
 
 use std::ffi::{c_char, c_int, c_long};
 use std::fs::File;
@@ -16,11 +16,7 @@ use std::sync::mpsc::{Sender, channel};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use objc2::rc::autoreleasepool;
-use objc2_foundation::{NSString, ns_string};
-
 unsafe extern "C" {
-    fn NSLog(format: *const NSString, ...);
     fn localtime_r(time: *const c_long, result: *mut Tm) -> *mut Tm;
 }
 
@@ -86,15 +82,11 @@ fn start_writer() -> Mutex<Sender<Entry>> {
         let mut file = open();
         for entry in receiver {
             let thread = if entry.main_thread { "main" } else { "background" };
+            let line = format!("{} [{thread}] {}", timestamp(entry.time), entry.message);
             if let Some(file) = &mut file {
-                let _ = writeln!(file, "{} [{thread}] {}", timestamp(entry.time), entry.message);
+                let _ = writeln!(file, "{line}");
             }
-
-            autoreleasepool(|_| {
-                let message = NSString::from_str(&entry.message);
-                // SAFETY: The format string consumes exactly one object argument.
-                unsafe { NSLog(ns_string!("%@"), &*message as *const NSString) };
-            });
+            eprintln!("{line}");
         }
     });
     Mutex::new(sender)

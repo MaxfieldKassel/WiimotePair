@@ -1,7 +1,7 @@
 // Copyright 2024 Dolphin Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::ffi::c_int;
 
 use objc2::rc::Retained;
@@ -23,11 +23,19 @@ use crate::show_alert;
 
 const K_IO_RETURN_SUCCESS: c_int = 0;
 
+/// How many times to retry pairing a Wii Remote without telling the user.
+///
+/// System daemons such as PerfPowerServices also reply to the Wii Remote's PIN code request, without the right PIN,
+/// and bluetoothd only uses the first reply. WiimotePair's reply is usually first, but not always, so a failed attempt
+/// is worth retrying while the Wii Remote is still in pairing mode.
+const AUTOMATIC_RETRIES: u32 = 3;
+
 pub struct PairerIvars {
     window: Retained<NSWindow>,
     central_manager: OnceCell<Retained<CBCentralManager>>,
     device_inquiry: RefCell<Option<Retained<IOBluetoothDeviceInquiry>>>,
     device_pair: RefCell<Option<Retained<IOBluetoothDevicePair>>>,
+    failed_attempts: Cell<u32>,
 }
 
 define_class!(
@@ -97,6 +105,7 @@ impl Pairer {
             central_manager: OnceCell::new(),
             device_inquiry: RefCell::new(None),
             device_pair: RefCell::new(None),
+            failed_attempts: Cell::new(0),
         });
         // SAFETY: NSObject's init method has this signature.
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
@@ -264,7 +273,12 @@ impl Pairer {
         };
         unsafe { pair.stop() };
 
-        if error != K_IO_RETURN_SUCCESS {
+        if error != K_IO_RETURN_SUCCESS && self.ivars().failed_attempts.get() < AUTOMATIC_RETRIES {
+            let failed_attempts = self.ivars().failed_attempts.get() + 1;
+            self.ivars().failed_attempts.set(failed_attempts);
+            log!("Retrying automatically ({failed_attempts} of {AUTOMATIC_RETRIES})");
+            self.resume_inquiry();
+        } else if error != K_IO_RETURN_SUCCESS {
             self.show_pairing_result_alert(
                 "Pairing Error",
                 &format!(
@@ -279,16 +293,19 @@ impl Pairer {
     }
 
     fn show_pairing_result_alert(&self, title: &str, text: &str) {
+        self.ivars().failed_attempts.set(0);
         let this = self.retain();
-        self.show_alert(title, text, move || {
-            // Resume searching so another Wii Remote (or another attempt with the same one) can be paired.
-            if let Some(inquiry) = this.device_inquiry() {
-                unsafe {
-                    inquiry.clearFoundDevices();
-                    inquiry.start();
-                }
+        // Resume searching so another Wii Remote (or another attempt with the same one) can be paired.
+        self.show_alert(title, text, move || this.resume_inquiry());
+    }
+
+    fn resume_inquiry(&self) {
+        if let Some(inquiry) = self.device_inquiry() {
+            unsafe {
+                inquiry.clearFoundDevices();
+                inquiry.start();
             }
-        });
+        }
     }
 
     fn show_fatal_error_alert(&self, title: &str, text: &str) {
