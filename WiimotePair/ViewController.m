@@ -7,6 +7,69 @@
 #import "IOBluetoothDevice+Private.h"
 #import "IOBluetoothDevicePair+Private.h"
 
+// In practice, IOBluetoothDevicePair reports pairing failures as Bluetooth HCI status codes rather than IOReturn values.
+// Passing these to mach_error_string() produces unrelated messages, e.g. HCI 0x1F (Unspecified Error) becomes
+// "(os/kern) default set" and HCI 0x02 (No Connection) becomes "(os/kern) protection failure".
+static NSString* DescribePairingError(IOReturn error) {
+    if (error <= 0 || error > 0xFF) {
+        return [NSString stringWithFormat:@"\"%s\"", mach_error_string(error)];
+    }
+    
+    NSString* description;
+    switch (error) {
+        case kBluetoothHCIErrorNoConnection:
+            description = @"No connection";
+            break;
+        case kBluetoothHCIErrorPageTimeout:
+            description = @"Page timeout";
+            break;
+        case kBluetoothHCIErrorAuthenticationFailure:
+            description = @"Authentication failure";
+            break;
+        case kBluetoothHCIErrorKeyMissing:
+            description = @"PIN or key missing";
+            break;
+        case kBluetoothHCIErrorConnectionTimeout:
+            description = @"Connection timeout";
+            break;
+        case kBluetoothHCIErrorHostRejectedSecurityReasons:
+            description = @"Connection rejected due to security reasons";
+            break;
+        case kBluetoothHCIErrorHostTimeout:
+            description = @"Connection accept timeout";
+            break;
+        case kBluetoothHCIErrorOtherEndTerminatedConnectionUserEnded:
+            description = @"Remote device terminated the connection";
+            break;
+        case kBluetoothHCIErrorConnectionTerminatedByLocalHost:
+            description = @"Connection terminated by local host";
+            break;
+        case kBluetoothHCIErrorRepeatedAttempts:
+            description = @"Repeated attempts";
+            break;
+        case kBluetoothHCIErrorPairingNotAllowed:
+            description = @"Pairing not allowed";
+            break;
+        case kBluetoothHCIErrorUnspecifiedError:
+            description = @"Unspecified error";
+            break;
+        case kBluetoothHCIErrorLMPResponseTimeout:
+            description = @"LMP response timeout";
+            break;
+        case kBluetoothHCIErrorPairingWithUnitKeyNotSupported:
+            description = @"Pairing with unit key not supported";
+            break;
+        case kBluetoothHCIErrorInsufficientSecurity:
+            description = @"Insufficient security";
+            break;
+        default:
+            description = @"Unknown error";
+            break;
+    }
+    
+    return [NSString stringWithFormat:@"\"%@\" (Bluetooth error 0x%02X)", description, error];
+}
+
 @implementation ViewController {
     CBCentralManager* _centralManager;
     IOBluetoothDeviceInquiry* _deviceInquiry;
@@ -45,7 +108,9 @@
 
 - (void)showPairingResultAlertWithTitle:(NSString*)title text:(NSString*)text {
     [self showAlertWithTitle:title text:text callback:^{
-        if (self->_deviceInquiry == nil) {
+        // Resume searching so another Wii Remote (or another attempt with the same one) can be paired.
+        if (self->_deviceInquiry != nil) {
+            [self->_deviceInquiry clearFoundDevices];
             [self->_deviceInquiry start];
         }
     }];
@@ -166,9 +231,7 @@
     _devicePair = nil;
     
     if (error != kIOReturnSuccess) {
-        char* pairResultString = mach_error_string(error);
-        
-        [self showPairingResultAlertWithTitle:@"Pairing Error" text:[NSString stringWithFormat:@"An error occurred while attempting to pair: \"%s\".", pairResultString]];
+        [self showPairingResultAlertWithTitle:@"Pairing Error" text:[NSString stringWithFormat:@"An error occurred while attempting to pair: %@.\n\nMake sure to press the SYNC button on the back of the Wii Remote, not the 1 and 2 buttons.", DescribePairingError(error)]];
     } else {
         [self showPairingResultAlertWithTitle:@"Paired" text:@"The Wii Remote has been paired with your Mac."];
     }
