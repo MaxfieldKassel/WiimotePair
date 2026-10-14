@@ -72,6 +72,30 @@
         );
       });
 
+      apps = forAllSystems (
+        pkgs:
+        let
+          app = "${self.packages.${pkgs.stdenv.hostPlatform.system}.rust}/Applications/WiimotePair.app";
+        in
+        {
+          # nix run: builds and opens WiimotePair.
+          default = {
+            type = "app";
+            program = "${pkgs.writeShellScript "wiimotepair" "exec /usr/bin/open -W ${app}"}";
+            meta.description = "Pair Wii Remotes";
+          };
+
+          # nix run .#debug -- [--pause]: runs WiimotePair while recording the Bluetooth logs.
+          debug = {
+            type = "app";
+            program = "${pkgs.writeShellScript "wiimotepair-debug" ''
+              WIIMOTEPAIR_APP=${app} exec /bin/sh ${./scripts/debug-pairing.sh} "$@"
+            ''}";
+            meta.description = "Pair Wii Remotes while recording the Bluetooth logs";
+          };
+        }
+      );
+
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           inputsFrom = [ self.packages.${pkgs.stdenv.hostPlatform.system}.rust ];

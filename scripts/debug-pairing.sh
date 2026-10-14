@@ -12,6 +12,10 @@
 # resumed when WiimotePair quits or this script is interrupted.
 #
 # Usage: scripts/debug-pairing.sh [--pause]
+#    or: nix run .#debug -- [--pause]
+#
+# Set WIIMOTEPAIR_APP to the path of an already built WiimotePair.app to skip
+# building it (nix run does this).
 
 set -eu
 
@@ -20,8 +24,12 @@ if [ "${1:-}" = "--pause" ]; then
     pause=1
 fi
 
-cd "$(dirname "$0")/.."
-nix build
+app="${WIIMOTEPAIR_APP:-}"
+if [ -z "$app" ]; then
+    cd "$(dirname "$0")/.."
+    nix build
+    app="$PWD/result/Applications/WiimotePair.app"
+fi
 
 out="$HOME/Desktop/WiimotePair-debug-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$out"
@@ -51,4 +59,4 @@ log_pid=$!
 echo "Running WiimotePair. Press SYNC on the Wii Remote; if pairing fails, click OK and press SYNC again."
 echo "Quit WiimotePair (Cmd-Q) when you are done."
 # WiimotePair also writes its log to stderr, which avoids reading its sandbox container (which macOS protects).
-open -W --stderr "$out/WiimotePair.log" result/Applications/WiimotePair.app
+open -W --stderr "$out/WiimotePair.log" "$app"

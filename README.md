@@ -25,6 +25,8 @@ nix build .#objc     # Objective-C version
 open result/Applications/WiimotePair.app
 ```
 
+Or run `nix run` to build and open the Rust version in one step.
+
 For development, `nix develop` provides a shell with everything needed to run
 `make` (Rust, output in `build/WiimotePair.app`) or `make objc` (Objective-C,
 output in `build/objc/WiimotePair.app`), as well as `cargo`, `clippy` and
@@ -56,7 +58,8 @@ cat ~/Library/Containers/org.dolphin-emu.WiimotePair/Data/Library/Logs/WiimotePa
 
 Include this log when reporting a pairing problem.
 
-`scripts/debug-pairing.sh` builds the app, runs it while recording the
+`scripts/debug-pairing.sh` (or `nix run .#debug`) builds the app, runs it while recording the
 Bluetooth logs, and collects both logs into a folder on the Desktop. Pass
 `--pause` to pause PerfPowerServices while the app runs: it answers Wii Remote
-PIN requests without the right PIN, and sometimes does so before WiimotePair.
+PIN requests without the right PIN, and sometimes does so before WiimotePair
+(with `nix run`, pass it after `--`: `nix run .#debug -- --pause`).
