@@ -8,11 +8,13 @@
 
 use std::ffi::{CStr, c_uint};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Imp, NSObjectProtocol, Sel};
 use objc2::{Message, ffi, msg_send, sel};
-use objc2_foundation::{NSNumber, NSUInteger};
+use objc2_foundation::NSNumber;
 use objc2_io_bluetooth::{IOBluetoothDevice, IOBluetoothDevicePair};
 
 use crate::log::log;
@@ -88,28 +90,6 @@ fn coordinator(receiver: Option<&AnyObject>) -> Result<Retained<AnyObject>, Miss
     Err(MissingApi("-[IOBluetoothCoreBluetoothCoordinator pairPeer:forType:withKey:]"))
 }
 
-/// Logs the methods of a class that are related to pairing, to help find replacements for private APIs that change.
-fn log_methods(class_name: &CStr) {
-    let Some(class) = AnyClass::get(class_name) else {
-        log!("{} does not exist", class_name.to_string_lossy());
-        return;
-    };
-    let keywords = ["pair", "pin", "shared", "coordinator", "respond", "reply", "agent", "passkey", "instance"];
-    for (prefix, class) in [("+", class.metaclass()), ("-", class)] {
-        for method in class.instance_methods().iter() {
-            let name = method.name().name().to_string_lossy();
-            if !keywords.iter().any(|keyword| name.to_lowercase().contains(keyword)) {
-                continue;
-            }
-            // SAFETY: The method is valid, and the encoding is a static string or NULL.
-            let encoding = unsafe { ffi::method_getTypeEncoding(*method) };
-            let encoding =
-                if encoding.is_null() { "?".into() } else { unsafe { CStr::from_ptr(encoding) }.to_string_lossy() };
-            log!("  {prefix}[{} {name}] {encoding}", class_name.to_string_lossy());
-        }
-    }
-}
-
 /// Replies to a PIN code request with the given key.
 ///
 /// This is what `-[IOBluetoothDevicePair replyPINCode:PINCode:]` essentially does. However, that method does a bunch
@@ -123,7 +103,7 @@ pub fn reply_pin_code(pair: &IOBluetoothDevicePair, device: &IOBluetoothDevice, 
 
     // SAFETY: These methods exist (checked above) and have these signatures.
     unsafe {
-        let pairing_type: NSUInteger = msg_send![pair, currentPairingType];
+        let pairing_type: isize = msg_send![pair, currentPairingType];
         let peer: Option<Retained<AnyObject>> = msg_send![device, classicPeer];
         log!("Replying to PIN code request: pairing type {pairing_type}, classic peer {peer:?}");
         let key = NSNumber::new_u64(key);
@@ -133,48 +113,116 @@ pub fn reply_pin_code(pair: &IOBluetoothDevicePair, device: &IOBluetoothDevice, 
     Ok(())
 }
 
-/// The key to reply with when a pairing agent requests pairing, set while WiimotePair is pairing a Wii Remote.
-static PAIRING_KEY: Mutex<Option<u64>> = Mutex::new(None);
+/// A reply to the Wii Remote's PIN code request, prepared in advance so that it can be sent as quickly as possible.
+///
+/// Several system daemons, such as PerfPowerServices and cloudpaird, register pairing agents that reply to every PIN
+/// code request without the right PIN, and bluetoothd only uses the first reply it receives. On macOS 27, they reply
+/// within about 0.3 ms of the request, so WiimotePair has to reply before them.
+struct PinReply {
+    coordinator: Retained<AnyObject>,
+    peer: Retained<AnyObject>,
+    key: Retained<NSNumber>,
+}
 
-/// The implementations of `pairingAgent:peerDidRequestPairing:type:passkey:` replaced by [`install_pairing_hook`].
-static ORIGINAL_IMPS: Mutex<Vec<(usize, Imp)>> = Mutex::new(Vec::new());
+// SAFETY: The objects are only used to call -[IOBluetoothCoreBluetoothCoordinator pairPeer:forType:withKey:], which
+// IOBluetooth itself calls from CoreBluetooth's queue.
+unsafe impl Send for PinReply {}
+
+static PIN_REPLY: Mutex<Option<PinReply>> = Mutex::new(None);
+
+/// Whether the PIN was sent when the pairing agent received a request, before its delegate was called. Only logged.
+static REPLIED: AtomicBool = AtomicBool::new(false);
+
+/// The pairing type that CoreBluetooth reports for the Wii Remote's PIN code request on macOS 27.
+const PAIRING_TYPE: isize = 0;
+
+/// Prepares to reply to the PIN code request for `device` with `key`, until [`clear_pin_reply`] is called.
+pub fn prepare_pin_reply(device: &IOBluetoothDevice, key: u64) -> Result<(), MissingApi> {
+    require(device, sel!(classicPeer), "-[IOBluetoothDevice classicPeer]")?;
+    // SAFETY: The method exists and returns an object.
+    let peer: Option<Retained<AnyObject>> = unsafe { msg_send![device, classicPeer] };
+    let peer = peer.ok_or(MissingApi("-[IOBluetoothDevice classicPeer]"))?;
+    let coordinator = coordinator(None)?;
+    log!("Prepared PIN reply through {coordinator:?} for {peer:?}");
+
+    REPLIED.store(false, Ordering::SeqCst);
+    *PIN_REPLY.lock().unwrap_or_else(|error| error.into_inner()) =
+        Some(PinReply { coordinator, peer, key: NSNumber::new_u64(key) });
+    Ok(())
+}
+
+pub fn clear_pin_reply() {
+    *PIN_REPLY.lock().unwrap_or_else(|error| error.into_inner()) = None;
+    REPLIED.store(false, Ordering::SeqCst);
+}
+
+/// Sends the prepared PIN reply, if there is one.
+fn send_pin_reply() -> bool {
+    let reply = PIN_REPLY.lock().unwrap_or_else(|error| error.into_inner());
+    let Some(reply) = reply.as_ref() else {
+        return false;
+    };
+    // SAFETY: The method exists (checked by coordinator()) and has this signature.
+    let _: () =
+        unsafe { msg_send![&reply.coordinator, pairPeer: &*reply.peer, forType: PAIRING_TYPE, withKey: &*reply.key] };
+    true
+}
+
+/// The implementations replaced by [`install_pairing_hooks`], by class and selector.
+static ORIGINAL_IMPS: Mutex<Vec<(usize, Sel, Imp)>> = Mutex::new(Vec::new());
 
 type PeerDidRequestPairing =
     unsafe extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject, *mut AnyObject, isize, *mut AnyObject);
+type HandlePairingRequested = unsafe extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject);
 
-/// Sets the key that the pairing hook replies with, or clears it.
-pub fn set_pairing_key(key: Option<u64>) {
-    *PAIRING_KEY.lock().unwrap_or_else(|error| error.into_inner()) = key;
-}
-
-/// Hooks the CoreBluetooth pairing agent delegate methods that IOBluetooth implements.
+/// Hooks the methods that receive the Wii Remote's PIN code request, so that WiimotePair can reply to it.
 ///
 /// On recent versions of macOS, IOBluetooth is implemented on top of CoreBluetooth. When a classic device requests a
-/// PIN code, CoreBluetooth calls `-pairingAgent:peerDidRequestPairing:type:passkey:` on IOBluetooth, which treats the
-/// request as "Just Works" pairing: it never asks IOBluetoothDevicePair's delegate for a PIN code and replies without
-/// one, so pairing a Wii Remote fails. While a pairing key is set, the hook replies with that key instead.
-pub fn install_pairing_hook() {
-    let selector = sel!(pairingAgent:peerDidRequestPairing:type:passkey:);
+/// PIN code, CoreBluetooth's pairing agent receives `-handlePairingRequested:` and then calls
+/// `-pairingAgent:peerDidRequestPairing:type:passkey:` on IOBluetooth, which treats the request as "Just Works"
+/// pairing: it never asks IOBluetoothDevicePair's delegate for a PIN code and replies without one.
+///
+/// While a PIN reply is prepared, the hooks send it as early as possible: when the pairing agent receives the request,
+/// or failing that, when its delegate is called.
+pub fn install_pairing_hooks() {
+    let hooked = hook_classes_in_image(c"CBPairingAgent", sel!(handlePairingRequested:), 3, unsafe {
+        std::mem::transmute::<HandlePairingRequested, Imp>(handle_pairing_requested)
+    }) + hook_classes_in_image(
+        c"IOBluetoothCoreBluetoothCoordinator",
+        sel!(pairingAgent:peerDidRequestPairing:type:passkey:),
+        6,
+        unsafe { std::mem::transmute::<PeerDidRequestPairing, Imp>(peer_did_request_pairing) },
+    );
+    if hooked == 0 {
+        log!("Could not hook any pairing request handlers");
+    }
+}
 
-    let Some(coordinator_class) = AnyClass::get(c"IOBluetoothCoreBluetoothCoordinator") else {
-        log!("Not hooking pairing requests: IOBluetoothCoreBluetoothCoordinator does not exist");
-        return;
+/// Replaces `selector` with `hook` in every class in the same image as `image_class` that implements it itself.
+///
+/// `hook` must have the same signature as the method, which takes `arguments` arguments including self and _cmd.
+fn hook_classes_in_image(image_class: &CStr, selector: Sel, arguments: usize, hook: Imp) -> usize {
+    let Some(image_class) = AnyClass::get(image_class) else {
+        log!("Not hooking {selector}: {} does not exist", image_class.to_string_lossy());
+        return 0;
     };
 
-    // The method may be implemented by a class other than the coordinator, so check every class in its image.
     // SAFETY: The class is valid, and the image name is a static string or NULL.
-    let image = unsafe { ffi::class_getImageName(coordinator_class) };
+    let image = unsafe { ffi::class_getImageName(image_class) };
     if image.is_null() {
-        log!("Not hooking pairing requests: could not find the IOBluetooth image");
-        return;
+        log!("Not hooking {selector}: could not find the image of {}", image_class.name().to_string_lossy());
+        return 0;
     }
 
     let mut count: c_uint = 0;
     // SAFETY: image is a valid image name, and the returned array is freed below.
     let names = unsafe { ffi::objc_copyClassNamesForImage(image, &mut count) };
     if names.is_null() {
-        log!("Not hooking pairing requests: could not list the IOBluetooth classes");
-        return;
+        log!(
+            "Not hooking {selector}: could not list the classes in {}",
+            unsafe { CStr::from_ptr(image) }.to_string_lossy()
+        );
+        return 0;
     }
     // SAFETY: The array contains count valid C strings.
     let classes: Vec<&'static AnyClass> = unsafe { std::slice::from_raw_parts(names, count as usize) }
@@ -184,49 +232,62 @@ pub fn install_pairing_hook() {
     // SAFETY: The array was allocated by the runtime with malloc.
     unsafe { free(names.cast()) };
 
+    let mut hooked = 0;
     let mut original_imps = ORIGINAL_IMPS.lock().unwrap_or_else(|error| error.into_inner());
     for class in classes {
         // Only hook classes that implement the method themselves, rather than inheriting it.
         let Some(method) = class.instance_methods().iter().find(|method| method.name() == selector).copied() else {
             continue;
         };
-        if method.arguments_count() != 6 {
-            log!("Not hooking pairing requests in {}: unexpected method signature", class.name().to_string_lossy());
+        let class_name = class.name().to_string_lossy();
+        if method.arguments_count() != arguments {
+            log!("Not hooking -[{class_name} {selector}]: unexpected method signature");
             continue;
         }
 
-        let hook: PeerDidRequestPairing = peer_did_request_pairing;
-        // SAFETY: The hook has the same signature as the original method, and calls it when it does not handle the
-        // request.
-        let original = unsafe { method.set_implementation(std::mem::transmute::<PeerDidRequestPairing, Imp>(hook)) };
-        original_imps.push((class as *const AnyClass as usize, original));
-        log!("Hooked pairing requests in {}", class.name().to_string_lossy());
+        // SAFETY: The caller guarantees that the hook has the same signature as the method. The hook calls the
+        // original implementation.
+        let original = unsafe { method.set_implementation(hook) };
+        original_imps.push((class as *const AnyClass as usize, selector, original));
+        log!("Hooked -[{class_name} {selector}]");
+        hooked += 1;
     }
-
-    if original_imps.is_empty() {
-        log!("Not hooking pairing requests: no class implements {selector}");
-    }
-    drop(original_imps);
-
-    log!("Pairing related methods:");
-    for class_name in [c"IOBluetoothCoreBluetoothCoordinator", c"IOBluetoothDevicePair", c"CBPairingAgent"] {
-        log_methods(class_name);
-    }
+    hooked
 }
 
-/// Finds the original implementation for the class of `object`, or the nearest hooked superclass.
-fn original_imp(object: &AnyObject) -> Option<PeerDidRequestPairing> {
+/// Finds the original implementation of `selector` for the class of `object`, or the nearest hooked superclass.
+fn original_imp(object: *mut AnyObject, selector: Sel) -> Option<Imp> {
+    // SAFETY: object is a valid object, since the runtime is calling a method on it.
+    let object = unsafe { object.as_ref() }?;
     let original_imps = ORIGINAL_IMPS.lock().unwrap_or_else(|error| error.into_inner());
     let mut class = Some(object.class());
     while let Some(current) = class {
-        if let Some((_, imp)) = original_imps.iter().find(|(hooked, _)| *hooked == current as *const AnyClass as usize)
+        let address = current as *const AnyClass as usize;
+        if let Some((_, _, imp)) =
+            original_imps.iter().find(|(hooked, hooked_selector, _)| *hooked == address && *hooked_selector == selector)
         {
-            // SAFETY: The original implementation has this signature.
-            return Some(unsafe { std::mem::transmute::<Imp, PeerDidRequestPairing>(*imp) });
+            return Some(*imp);
         }
         class = current.superclass();
     }
     None
+}
+
+unsafe extern "C-unwind" fn handle_pairing_requested(this: *mut AnyObject, cmd: Sel, message: *mut AnyObject) {
+    // Reply before doing anything else, including logging, to beat the system daemons' replies.
+    let start = Instant::now();
+    if send_pin_reply() {
+        REPLIED.store(true, Ordering::SeqCst);
+        log!("Replied to pairing request with the Wii Remote's PIN in {} µs", start.elapsed().as_micros());
+    }
+    // SAFETY: The message is an object, as the method's type encoding says.
+    log!("Pairing agent received pairing request: {:?}", unsafe { message.as_ref() });
+
+    match original_imp(this, cmd) {
+        // SAFETY: The original implementation has this signature, and the arguments are passed through unchanged.
+        Some(original) => unsafe { std::mem::transmute::<Imp, HandlePairingRequested>(original)(this, cmd, message) },
+        None => log!("Could not find the original implementation of {cmd}"),
+    }
 }
 
 unsafe extern "C-unwind" fn peer_did_request_pairing(
@@ -237,35 +298,27 @@ unsafe extern "C-unwind" fn peer_did_request_pairing(
     pairing_type: isize,
     passkey: *mut AnyObject,
 ) {
-    // The passkey's type is not known for certain, so it is only logged as a pointer.
-    // SAFETY: this is a valid object, since the runtime is calling a method on it.
-    let class = unsafe { this.as_ref() }.map(|this| this.class().name().to_string_lossy()).unwrap_or_default();
-    log!("Pairing agent requested pairing from {class}: type {pairing_type}, passkey {passkey:p}, peer {peer:p}");
-
-    let key = *PAIRING_KEY.lock().unwrap_or_else(|error| error.into_inner());
-    if let Some(key) = key
-        && !peer.is_null()
-    {
-        // SAFETY: this is a valid object, since the runtime is calling a method on it.
-        match coordinator(unsafe { this.as_ref() }) {
-            Ok(coordinator) => {
-                log!("Replying to pairing request with the Wii Remote's PIN through {coordinator:?}");
-                let key = NSNumber::new_u64(key);
-                // SAFETY: The method exists (checked by coordinator()), and peer is the peer that requested pairing.
-                let _: () = unsafe {
-                    msg_send![&coordinator, pairPeer: peer, forType: pairing_type as NSUInteger, withKey: &*key]
-                };
-                return;
-            }
-            Err(error) => log!("Could not reply to pairing request: {error}"),
-        }
+    // Send the PIN again even if it was already sent when the pairing agent received the request, in case that was a
+    // different request. bluetoothd ignores replies to requests that were already answered. Never call the original
+    // implementation while a reply is prepared, since it would reply without the PIN.
+    let already_replied = REPLIED.swap(false, Ordering::SeqCst);
+    let start = Instant::now();
+    if send_pin_reply() {
+        log!(
+            "Replied to pairing request with the Wii Remote's PIN from the delegate in {} µs (already replied: \
+             {already_replied}): type {pairing_type}, passkey {passkey:p}",
+            start.elapsed().as_micros()
+        );
+        return;
     }
 
-    // SAFETY: this is a valid object, since the runtime is calling a method on it.
-    let original = unsafe { this.as_ref() }.and_then(original_imp);
-    match original {
-        // SAFETY: The arguments are passed through unchanged.
-        Some(original) => unsafe { original(this, cmd, agent, peer, pairing_type, passkey) },
-        None => log!("Could not find the original pairing request handler"),
+    // The passkey's type is not known for certain, so it is only logged as a pointer.
+    log!("Pairing agent delegate called: type {pairing_type}, passkey {passkey:p}; no PIN reply is prepared");
+    match original_imp(this, cmd) {
+        // SAFETY: The original implementation has this signature, and the arguments are passed through unchanged.
+        Some(original) => unsafe {
+            std::mem::transmute::<Imp, PeerDidRequestPairing>(original)(this, cmd, agent, peer, pairing_type, passkey)
+        },
+        None => log!("Could not find the original implementation of {cmd}"),
     }
 }

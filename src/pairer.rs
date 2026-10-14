@@ -111,7 +111,7 @@ impl Pairer {
         };
         this.ivars().central_manager.set(central_manager).ok();
 
-        private_api::install_pairing_hook();
+        private_api::install_pairing_hooks();
 
         this
     }
@@ -129,7 +129,7 @@ impl Pairer {
     fn take_device_pair(&self) -> Option<Retained<IOBluetoothDevicePair>> {
         let pair = self.ivars().device_pair.borrow_mut().take();
         if pair.is_some() {
-            private_api::set_pairing_key(None);
+            private_api::clear_pin_reply();
         }
         pair
     }
@@ -210,15 +210,13 @@ impl Pairer {
             return;
         }
 
-        // The pairing hook replies to the Wii Remote's PIN code request with this key while the pair is active.
-        let key = match controller_pin_key() {
-            Ok(key) => key,
-            Err(message) => {
-                self.show_pairing_result_alert("Pairing Error", &message);
-                return;
-            }
-        };
-        private_api::set_pairing_key(Some(key));
+        // The pairing hooks reply to the Wii Remote's PIN code request while the pair is active.
+        let prepared = controller_pin_key()
+            .and_then(|key| private_api::prepare_pin_reply(device, key).map_err(|error| error.to_string()));
+        if let Err(message) = prepared {
+            self.show_pairing_result_alert("Pairing Error", &message);
+            return;
+        }
 
         *self.ivars().device_pair.borrow_mut() = Some(pair.clone());
 
