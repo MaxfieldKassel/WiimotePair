@@ -58,6 +58,14 @@ cat ~/Library/Containers/org.dolphin-emu.WiimotePair/Data/Library/Logs/WiimotePa
 
 Include this log when reporting a pairing problem.
 
+Third-party Wii Remotes may not pair on recent macOS. For some devices,
+bluetoothd saves the PIN to the keychain as a UTF-8 string before using it,
+and Wii Remote PINs are binary, so it logs "Unexpected pincode length of 6"
+and refuses the PIN request. Genuine Wii Remotes are not affected. Replying
+to the Bluetooth controller directly
+(`-[IOBluetoothHostController BluetoothHCIPINCodeRequestReply:inPINCodeLength:inPINCode:]`)
+does nothing on macOS 27.
+
 `scripts/debug-pairing.sh` (or `nix run .#debug`) builds the app, runs it while recording the
 Bluetooth logs, and collects both logs into a folder on the Desktop. Pass
 `--pause` to pause PerfPowerServices while the app runs: it answers Wii Remote

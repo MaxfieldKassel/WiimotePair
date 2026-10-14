@@ -6,7 +6,7 @@
 //! These are looked up at runtime instead of being linked against, so if a future version of macOS removes them,
 //! WiimotePair can report an error instead of failing to launch or crashing.
 
-use std::ffi::{CStr, c_int, c_uint};
+use std::ffi::{CStr, c_uint};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -15,12 +15,8 @@ use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::{AnyClass, AnyObject, Imp, NSObjectProtocol, Sel};
 use objc2::{Message, ffi, msg_send, sel};
 use objc2_foundation::{NSNumber, NSString};
-use objc2_io_bluetooth::{
-    BluetoothDeviceAddress, BluetoothPINCode, IOBluetoothDevice, IOBluetoothDevicePair, IOBluetoothHostController,
-    IOBluetoothNSStringToDeviceAddress,
-};
+use objc2_io_bluetooth::{IOBluetoothDevice, IOBluetoothDevicePair};
 
-use crate::errors::describe_io_return;
 use crate::log::log;
 
 unsafe extern "C" {
@@ -117,37 +113,16 @@ pub fn reply_pin_code(pair: &IOBluetoothDevicePair, device: &IOBluetoothDevice, 
     Ok(())
 }
 
-/// How a PIN reply is sent.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum ReplyPath {
-    /// Through CoreBluetooth's pairing agent, with `-[IOBluetoothCoreBluetoothCoordinator pairPeer:forType:withKey:]`.
-    PairingAgent,
-    /// Straight to the Bluetooth controller, with `-[IOBluetoothHostController
-    /// BluetoothHCIPINCodeRequestReply:inPINCodeLength:inPINCode:]`.
-    ///
-    /// This is an experiment for third-party Wii Remotes. For some devices, bluetoothd saves a PIN received from a
-    /// pairing agent to the keychain as a UTF-8 string before using it. Wii Remote PINs are binary and usually not valid
-    /// UTF-8, so saving fails, bluetoothd logs "Unexpected pincode length of 6" and refuses the PIN code request. Replying
-    /// to the controller directly may avoid that, if macOS still allows it.
-    Controller,
-}
-
 /// A reply to the Wii Remote's PIN code request, prepared before pairing starts.
 struct PinReply {
-    path: ReplyPath,
     coordinator: Retained<AnyObject>,
     peer: Retained<AnyObject>,
     key: Retained<NSNumber>,
-    controller: Retained<IOBluetoothHostController>,
-    device_address: BluetoothDeviceAddress,
-    pin: BluetoothPINCode,
 }
 
-// SAFETY: The objects are only used to send the reply, which IOBluetooth itself does from CoreBluetooth's queue.
+// SAFETY: The objects are only used to call -[IOBluetoothCoreBluetoothCoordinator pairPeer:forType:withKey:], which
+// IOBluetooth itself calls from CoreBluetooth's queue.
 unsafe impl Send for PinReply {}
-
-/// The length of a Wii Remote PIN, which is a Bluetooth address.
-const PIN_LENGTH: usize = 6;
 
 static PIN_REPLY: Mutex<Option<PinReply>> = Mutex::new(None);
 
@@ -167,40 +142,18 @@ const PIN_REPLY_DELAY: Duration = Duration::from_millis(20);
 /// type 0 ("Just Works") that IOBluetooth replies with, bluetoothd ignores the PIN and pairing times out.
 const PIN_CODE_PAIRING_TYPE: isize = 6;
 
-/// Prepares to reply to the PIN code request for `device` with `key` through `path`, until [`clear_pin_reply`] is
-/// called. `key` holds the PIN bytes in little-endian order.
-pub fn prepare_pin_reply(device: &IOBluetoothDevice, key: u64, path: ReplyPath) -> Result<(), MissingApi> {
+/// Prepares to reply to the PIN code request for `device` with `key`, until [`clear_pin_reply`] is called.
+pub fn prepare_pin_reply(device: &IOBluetoothDevice, key: u64) -> Result<(), MissingApi> {
     require(device, sel!(classicPeer), "-[IOBluetoothDevice classicPeer]")?;
     // SAFETY: The method exists and returns an object.
     let peer: Option<Retained<AnyObject>> = unsafe { msg_send![device, classicPeer] };
     let peer = peer.ok_or(MissingApi("-[IOBluetoothDevice classicPeer]"))?;
     let coordinator = coordinator(None)?;
-
-    let controller = unsafe { IOBluetoothHostController::defaultController() }
-        .ok_or(MissingApi("+[IOBluetoothHostController defaultController]"))?;
-    let path = if path == ReplyPath::Controller
-        && !controller.respondsToSelector(sel!(BluetoothHCIPINCodeRequestReply:inPINCodeLength:inPINCode:))
-    {
-        log!("This version of macOS cannot send PIN code replies to the Bluetooth controller; using the pairing agent");
-        ReplyPath::PairingAgent
-    } else {
-        path
-    };
-
-    let mut device_address = BluetoothDeviceAddress { data: [0; 6] };
-    if let Some(address_string) = unsafe { device.addressString() } {
-        // SAFETY: device_address is a valid pointer to a BluetoothDeviceAddress.
-        unsafe { IOBluetoothNSStringToDeviceAddress(Some(&address_string), &mut device_address) };
-    }
-
-    let mut pin = BluetoothPINCode { data: [0; 16] };
-    pin.data[..PIN_LENGTH].copy_from_slice(&key.to_le_bytes()[..PIN_LENGTH]);
-
-    log!("Prepared PIN reply through {path:?} for {peer:?} ({:02X?})", device_address.data);
+    log!("Prepared PIN reply through {coordinator:?} for {peer:?}");
 
     HANDLED.store(false, Ordering::SeqCst);
     *PIN_REPLY.lock().unwrap_or_else(|error| error.into_inner()) =
-        Some(PinReply { path, coordinator, peer, key: NSNumber::new_u64(key), controller, device_address, pin });
+        Some(PinReply { coordinator, peer, key: NSNumber::new_u64(key) });
     Ok(())
 }
 
@@ -219,27 +172,10 @@ fn send_pin_reply() -> bool {
     let Some(reply) = reply.as_ref() else {
         return false;
     };
-    match reply.path {
-        ReplyPath::PairingAgent => {
-            // SAFETY: The method exists (checked by coordinator()) and has this signature.
-            let _: () = unsafe {
-                msg_send![&reply.coordinator, pairPeer: &*reply.peer, forType: PIN_CODE_PAIRING_TYPE, withKey: &*reply.key]
-            };
-        }
-        ReplyPath::Controller => {
-            // SAFETY: The method exists (checked by prepare_pin_reply()) and has this signature, according to the macOS
-            // 26.4 IOBluetooth headers. The pointers are valid for the duration of the call.
-            let result: c_int = unsafe {
-                msg_send![
-                    &*reply.controller,
-                    BluetoothHCIPINCodeRequestReply: &reply.device_address as *const BluetoothDeviceAddress,
-                    inPINCodeLength: PIN_LENGTH as u64,
-                    inPINCode: &reply.pin as *const BluetoothPINCode
-                ]
-            };
-            log!("Bluetooth controller PIN code reply returned {result:#x} ({})", describe_io_return(result));
-        }
-    }
+    // SAFETY: The method exists (checked by coordinator()) and has this signature.
+    let _: () = unsafe {
+        msg_send![&reply.coordinator, pairPeer: &*reply.peer, forType: PIN_CODE_PAIRING_TYPE, withKey: &*reply.key]
+    };
     true
 }
 
