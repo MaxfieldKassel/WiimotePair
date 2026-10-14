@@ -8,13 +8,13 @@
 
 use std::ffi::{CStr, c_uint};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
-use objc2::rc::Retained;
+use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::{AnyClass, AnyObject, Imp, NSObjectProtocol, Sel};
 use objc2::{Message, ffi, msg_send, sel};
-use objc2_foundation::NSNumber;
+use objc2_foundation::{NSNumber, NSString};
 use objc2_io_bluetooth::{IOBluetoothDevice, IOBluetoothDevicePair};
 
 use crate::log::log;
@@ -122,6 +122,7 @@ struct PinReply {
     coordinator: Retained<AnyObject>,
     peer: Retained<AnyObject>,
     key: Retained<NSNumber>,
+    pairing_type: isize,
 }
 
 // SAFETY: The objects are only used to call -[IOBluetoothCoreBluetoothCoordinator pairPeer:forType:withKey:], which
@@ -133,8 +134,14 @@ static PIN_REPLY: Mutex<Option<PinReply>> = Mutex::new(None);
 /// Whether the PIN was sent when the pairing agent received a request, before its delegate was called. Only logged.
 static REPLIED: AtomicBool = AtomicBool::new(false);
 
-/// The pairing type that CoreBluetooth reports for the Wii Remote's PIN code request on macOS 27.
-const PAIRING_TYPE: isize = 0;
+/// The pairing types to reply with, one per pairing attempt.
+///
+/// On macOS 27, CoreBluetooth reports the Wii Remote's PIN code request as type 0, but bluetoothd treats a reply of
+/// type 0 as accepting "Just Works" Secure Simple Pairing and ignores the PIN. Which type bluetoothd treats as a PIN
+/// code reply is not known yet, so each attempt tries the next one, and the logs show how bluetoothd handles it.
+const PAIRING_TYPES: &[isize] = &[1, 2, 3, 4, 5, 6, 7, 8, 0];
+
+static ATTEMPT: AtomicUsize = AtomicUsize::new(0);
 
 /// Prepares to reply to the PIN code request for `device` with `key`, until [`clear_pin_reply`] is called.
 pub fn prepare_pin_reply(device: &IOBluetoothDevice, key: u64) -> Result<(), MissingApi> {
@@ -143,11 +150,16 @@ pub fn prepare_pin_reply(device: &IOBluetoothDevice, key: u64) -> Result<(), Mis
     let peer: Option<Retained<AnyObject>> = unsafe { msg_send![device, classicPeer] };
     let peer = peer.ok_or(MissingApi("-[IOBluetoothDevice classicPeer]"))?;
     let coordinator = coordinator(None)?;
-    log!("Prepared PIN reply through {coordinator:?} for {peer:?}");
+    let attempt = ATTEMPT.fetch_add(1, Ordering::SeqCst);
+    let pairing_type = PAIRING_TYPES[attempt % PAIRING_TYPES.len()];
+    log!(
+        "Prepared PIN reply for attempt {} with pairing type {pairing_type} through {coordinator:?} for {peer:?}",
+        attempt + 1
+    );
 
     REPLIED.store(false, Ordering::SeqCst);
     *PIN_REPLY.lock().unwrap_or_else(|error| error.into_inner()) =
-        Some(PinReply { coordinator, peer, key: NSNumber::new_u64(key) });
+        Some(PinReply { coordinator, peer, key: NSNumber::new_u64(key), pairing_type });
     Ok(())
 }
 
@@ -156,16 +168,15 @@ pub fn clear_pin_reply() {
     REPLIED.store(false, Ordering::SeqCst);
 }
 
-/// Sends the prepared PIN reply, if there is one.
-fn send_pin_reply() -> bool {
+/// Sends the prepared PIN reply, if there is one, and returns its pairing type.
+fn send_pin_reply() -> Option<isize> {
     let reply = PIN_REPLY.lock().unwrap_or_else(|error| error.into_inner());
-    let Some(reply) = reply.as_ref() else {
-        return false;
-    };
+    let reply = reply.as_ref()?;
     // SAFETY: The method exists (checked by coordinator()) and has this signature.
-    let _: () =
-        unsafe { msg_send![&reply.coordinator, pairPeer: &*reply.peer, forType: PAIRING_TYPE, withKey: &*reply.key] };
-    true
+    let _: () = unsafe {
+        msg_send![&reply.coordinator, pairPeer: &*reply.peer, forType: reply.pairing_type, withKey: &*reply.key]
+    };
+    Some(reply.pairing_type)
 }
 
 /// The implementations replaced by [`install_pairing_hooks`], by class and selector.
@@ -273,20 +284,42 @@ fn original_imp(object: *mut AnyObject, selector: Sel) -> Option<Imp> {
     None
 }
 
+/// An object that is only read, and so can be sent to the logging thread.
+struct SendObject(Retained<AnyObject>);
+
+// SAFETY: Only used for immutable objects, such as the dictionaries that CoreBluetooth passes to pairing agents.
+unsafe impl Send for SendObject {}
+
 unsafe extern "C-unwind" fn handle_pairing_requested(this: *mut AnyObject, cmd: Sel, message: *mut AnyObject) {
-    // Reply before doing anything else, including logging, to beat the system daemons' replies.
+    // Reply before doing anything else, to beat the system daemons' replies. Logging happens on another thread.
     let start = Instant::now();
-    if send_pin_reply() {
+    if let Some(pairing_type) = send_pin_reply() {
         REPLIED.store(true, Ordering::SeqCst);
-        log!("Replied to pairing request with the Wii Remote's PIN in {} µs", start.elapsed().as_micros());
+        log!(
+            "Replied to pairing request with the Wii Remote's PIN and pairing type {pairing_type} in {} µs",
+            start.elapsed().as_micros()
+        );
     }
-    // SAFETY: The message is an object, as the method's type encoding says.
-    log!("Pairing agent received pairing request: {:?}", unsafe { message.as_ref() });
 
     match original_imp(this, cmd) {
         // SAFETY: The original implementation has this signature, and the arguments are passed through unchanged.
         Some(original) => unsafe { std::mem::transmute::<Imp, HandlePairingRequested>(original)(this, cmd, message) },
         None => log!("Could not find the original implementation of {cmd}"),
+    }
+
+    // Describe the request on another thread, since it is slow. It shows what bluetoothd sent, including the pairing
+    // type before CoreBluetooth converts it.
+    // SAFETY: The message is an object, as the method's type encoding says.
+    if let Some(message) = unsafe { message.as_ref() } {
+        let message = SendObject(message.retain());
+        std::thread::spawn(move || {
+            let message = message;
+            autoreleasepool(|_| {
+                // SAFETY: Every object responds to description, which returns a string.
+                let description: Retained<NSString> = unsafe { msg_send![&*message.0, description] };
+                log!("Pairing agent received pairing request: {description}");
+            });
+        });
     }
 }
 
@@ -303,10 +336,10 @@ unsafe extern "C-unwind" fn peer_did_request_pairing(
     // implementation while a reply is prepared, since it would reply without the PIN.
     let already_replied = REPLIED.swap(false, Ordering::SeqCst);
     let start = Instant::now();
-    if send_pin_reply() {
+    if let Some(reply_type) = send_pin_reply() {
         log!(
-            "Replied to pairing request with the Wii Remote's PIN from the delegate in {} µs (already replied: \
-             {already_replied}): type {pairing_type}, passkey {passkey:p}",
+            "Replied to pairing request with the Wii Remote's PIN and pairing type {reply_type} from the delegate in {} \
+             µs (already replied: {already_replied}): requested type {pairing_type}, passkey {passkey:p}",
             start.elapsed().as_micros()
         );
         return;
