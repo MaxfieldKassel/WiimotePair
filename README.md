@@ -64,7 +64,8 @@ and Wii Remote PINs are binary, so it logs "Unexpected pincode length of 6"
 and refuses the PIN request. Genuine Wii Remotes are not affected. Replying
 to the Bluetooth controller directly
 (`-[IOBluetoothHostController BluetoothHCIPINCodeRequestReply:inPINCodeLength:inPINCode:]`)
-does nothing on macOS 27.
+does nothing on macOS 27. See `docs/third-party-remotes.md` for details and
+experiments that are still open.
 
 `scripts/debug-pairing.sh` (or `nix run .#debug`) builds the app, runs it while recording the
 Bluetooth logs, and collects both logs into a folder on the Desktop. Pass
