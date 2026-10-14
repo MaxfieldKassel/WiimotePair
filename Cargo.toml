@@ -18,7 +18,7 @@ objc2 = "0.6"
 [dependencies.objc2-foundation]
 version = "0.3"
 default-features = false
-features = ["std", "NSGeometry", "NSNotification", "NSObject", "NSString", "NSValue"]
+features = ["std", "NSGeometry", "NSNotification", "NSObject", "NSProcessInfo", "NSString", "NSValue"]
 
 [dependencies.objc2-app-kit]
 version = "0.3"

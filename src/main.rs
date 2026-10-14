@@ -7,6 +7,7 @@ mod pairer;
 mod private_api;
 
 use std::cell::OnceCell;
+use std::ffi::{CStr, c_char, c_int, c_void};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -16,8 +17,9 @@ use objc2_app_kit::{
     NSEventModifierFlags, NSMenu, NSMenuItem, NSProgressIndicator, NSProgressIndicatorStyle, NSTextAlignment,
     NSTextField, NSView, NSWindow, NSWindowStyleMask,
 };
-use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, ns_string};
+use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSPoint, NSProcessInfo, NSRect, NSSize, ns_string};
 
+use crate::log::log;
 use crate::pairer::Pairer;
 
 const INSTRUCTIONS: &str = "Press the 🔴 SYNC button on the back of your Wii Remote now.\n\n\
@@ -45,6 +47,8 @@ define_class!(
         #[unsafe(method(applicationDidFinishLaunching:))]
         fn application_did_finish_launching(&self, _notification: &NSNotification) {
             let mtm = self.mtm();
+
+            log_system_info();
 
             let window = create_window(mtm);
             window.makeKeyAndOrderFront(None);
@@ -78,6 +82,39 @@ impl AppDelegate {
         // SAFETY: NSObject's init method has this signature.
         unsafe { msg_send![super(this), init] }
     }
+}
+
+/// Logs the versions of WiimotePair and macOS, and the Mac model, to help diagnose pairing problems.
+fn log_system_info() {
+    let os_version = NSProcessInfo::processInfo().operatingSystemVersionString();
+    log!("WiimotePair {} on macOS {os_version}, {}", env!("CARGO_PKG_VERSION"), hardware_model());
+    if let Some(path) = log::path() {
+        log!("Logging to {}", path.display());
+    }
+}
+
+fn hardware_model() -> String {
+    unsafe extern "C" {
+        fn sysctlbyname(
+            name: *const c_char,
+            old: *mut c_void,
+            old_len: *mut usize,
+            new: *const c_void,
+            new_len: usize,
+        ) -> c_int;
+    }
+
+    let mut buffer = [0u8; 256];
+    let mut length = buffer.len();
+    // SAFETY: The buffer and length are valid, and nothing is written.
+    let result =
+        unsafe { sysctlbyname(c"hw.model".as_ptr(), buffer.as_mut_ptr().cast(), &mut length, std::ptr::null(), 0) };
+    if result != 0 {
+        return "unknown model".to_string();
+    }
+    CStr::from_bytes_until_nul(&buffer[..length.min(buffer.len())])
+        .map(|model| model.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "unknown model".to_string())
 }
 
 fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {

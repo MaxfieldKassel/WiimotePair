@@ -44,3 +44,14 @@ distribution.
 
 The Objective-C version can also be built by opening `WiimotePair.xcodeproj`
 and building the `WiimotePair` scheme.
+
+## Troubleshooting
+
+The Rust version writes a diagnostic log each time it runs. Since the app is
+sandboxed, the log is in its container:
+
+```sh
+cat ~/Library/Containers/org.dolphin-emu.WiimotePair/Data/Library/Logs/WiimotePair.log
+```
+
+Include this log when reporting a pairing problem.
